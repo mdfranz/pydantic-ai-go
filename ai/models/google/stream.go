@@ -67,6 +67,7 @@ func (m *Model) eventStream(
 		trafficType := ""
 		responseTimestamp := time.Now().UTC()
 		webSearchEmitted := false
+		textEmitted := false
 		var logprobs map[string]any
 		var avgLogprobs *float64
 		blockReason := ""
@@ -79,7 +80,9 @@ func (m *Model) eventStream(
 		explicitNativeTools := false
 		lastCodeCallID := ""
 		lastFileSearchCallID := ""
+		pendingNativeCallIDs := map[ai.ToolPartKind][]string{}
 		var pendingFileSearchReturns []ai.NativeToolReturnPart
+		var pendingWebSearchReturns []ai.NativeToolReturnPart
 		codeCallIndex := 0
 		fileSearchIndex := 0
 		fileIndex := 0
@@ -141,7 +144,14 @@ func (m *Model) eventStream(
 					break
 				}
 			}
-			if !explicitNativeTools && !webSearchEmitted {
+			chunkHasText := false
+			for _, candidatePart := range chunk.Candidates[0].Content.Parts {
+				if candidatePart.Text != "" && !candidatePart.Thought {
+					chunkHasText = true
+					break
+				}
+			}
+			if !explicitNativeTools && !webSearchEmitted && !textEmitted && !chunkHasText {
 				call, returned := googleWebSearchParts(
 					chunk.Candidates[0].GroundingMetadata, responseID, m.providerName, responseTimestamp,
 				)
@@ -171,10 +181,9 @@ func (m *Model) eventStream(
 						yield(nil, fmt.Errorf("google: unknown native tool type %q", part.ToolCall.ToolType))
 						return
 					}
-					callID := googleNativeCallID(
-						part.ToolCall.ID, responseID, part.ToolCall.ToolType, fileSearchIndex,
-					)
+					callID := googleNativeCallID(part.ToolCall.ID, responseID, part.ToolCall.ToolType, fileSearchIndex)
 					fileSearchIndex++
+					pendingNativeCallIDs[kind] = append(pendingNativeCallIDs[kind], callID)
 					args := part.ToolCall.Args
 					if args == nil {
 						args = map[string]any{}
@@ -197,16 +206,24 @@ func (m *Model) eventStream(
 						yield(nil, fmt.Errorf("google: unknown native tool type %q", part.ToolResponse.ToolType))
 						return
 					}
-					callID := part.ToolResponse.ID
-					if callID == "" && kind == ai.ToolPartKindFileSearch && lastFileSearchCallID != "" {
-						callID = lastFileSearchCallID
-					} else {
-						callID = googleNativeCallID(callID, responseID, part.ToolResponse.ToolType, fileSearchIndex)
-					}
+					callID := googleNativeResponseCallID(
+						pendingNativeCallIDs, kind, part.ToolResponse.ID, responseID, part.ToolResponse.ToolType, fileSearchIndex,
+					)
 					_, providerDetails := googlePartMetadata(part.ThoughtSignature, m.providerName)
+					content := part.ToolResponse.Response
+					if kind == ai.ToolPartKindWebSearch {
+						providerDetails = googleNativeReturnDetails(providerDetails, content)
+						if sources := googleWebSearchSources(groundingMetadata); len(sources) > 0 {
+							content = sources
+						}
+					}
 					returned := ai.NativeToolReturnPart{
-						ToolName: name, ToolCallID: callID, ToolKind: kind, Content: part.ToolResponse.Response,
+						ToolName: name, ToolCallID: callID, ToolKind: kind, Content: content,
 						Timestamp: responseTimestamp, ProviderName: m.providerName, ProviderDetails: providerDetails,
+					}
+					if kind == ai.ToolPartKindWebSearch && len(googleWebSearchSources(groundingMetadata)) == 0 {
+						pendingWebSearchReturns = append(pendingWebSearchReturns, returned)
+						continue
 					}
 					if kind == ai.ToolPartKindFileSearch && returned.Content == nil {
 						pendingFileSearchReturns = append(pendingFileSearchReturns, returned)
@@ -288,12 +305,29 @@ func (m *Model) eventStream(
 					}
 					lastCodeCallID = ""
 				default:
+					if part.Text != "" && !part.Thought {
+						textEmitted = true
+					}
 					if !emitPart(yield, part, index, m.providerName) {
 						return
 					}
 				}
 			}
 			contexts := googleFileSearchContexts(chunk.Candidates[0].GroundingMetadata)
+			if len(pendingWebSearchReturns) > 0 {
+				if sources := googleWebSearchSources(groundingMetadata); len(sources) > 0 {
+					for index := range pendingWebSearchReturns {
+						pendingWebSearchReturns[index].Content = sources
+						if !yield(ai.NativeToolReturnEvent{
+							PartID: "return:" + pendingWebSearchReturns[index].ToolCallID,
+							Part:   pendingWebSearchReturns[index],
+						}, nil) {
+							return
+						}
+					}
+					pendingWebSearchReturns = nil
+				}
+			}
 			switch {
 			case len(pendingFileSearchReturns) > 0 && len(contexts) > 0:
 				for index := range pendingFileSearchReturns {
@@ -334,6 +368,13 @@ func (m *Model) eventStream(
 			return
 		}
 		for _, pending := range pendingFileSearchReturns {
+			if !yield(ai.NativeToolReturnEvent{
+				PartID: "return:" + pending.ToolCallID, Part: pending,
+			}, nil) {
+				return
+			}
+		}
+		for _, pending := range pendingWebSearchReturns {
 			if !yield(ai.NativeToolReturnEvent{
 				PartID: "return:" + pending.ToolCallID, Part: pending,
 			}, nil) {
@@ -385,6 +426,31 @@ func (m *Model) eventStream(
 			FinishReason: normalizedFinishReason, State: ai.ModelResponseStateComplete,
 		}, nil)
 	}
+}
+
+func googleNativeResponseCallID(
+	pending map[ai.ToolPartKind][]string,
+	kind ai.ToolPartKind,
+	id, responseID, toolType string,
+	index int,
+) string {
+	if id == "" {
+		if calls := pending[kind]; len(calls) > 0 {
+			id = calls[0]
+			pending[kind] = calls[1:]
+			return id
+		}
+		return googleNativeCallID("", responseID, toolType, index)
+	}
+	callID := googleNativeCallID(id, responseID, toolType, index)
+	calls := pending[kind]
+	for index, pendingID := range calls {
+		if pendingID == callID {
+			pending[kind] = append(calls[:index], calls[index+1:]...)
+			break
+		}
+	}
+	return callID
 }
 
 func emitGoogleNativeTool(

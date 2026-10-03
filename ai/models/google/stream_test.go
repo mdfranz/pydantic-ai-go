@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,8 +44,8 @@ func collectGoogleStream(
 func TestGoogleStreamWebSearchGroundingMetadata(t *testing.T) {
 	grounding := `"groundingMetadata":{"webSearchQueries":["Go news"],"groundingChunks":[{"web":{"uri":"https://go.dev","title":"Go"}}]}`
 	model := newServer(t, googleSSE(t, []string{
-		`{"responseId":"response","candidates":[{"content":{"parts":[{"text":"first"}]},` + grounding + `}]}`,
-		`{"responseId":"response","candidates":[{"content":{"parts":[{"text":"second"}]},` + grounding + `}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}`,
+		`{"responseId":"response","candidates":[{"content":{"parts":[]},` + grounding + `}]}`,
+		`{"responseId":"response","candidates":[{"content":{"parts":[{"text":"answer"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}`,
 	}))
 	events, err := collectGoogleStream(t, model, ai.ModelRequestParams{
 		NativeTools: []ai.NativeTool{ai.WebSearchTool{}},
@@ -235,6 +236,170 @@ func TestGoogleStreamExplicitFileSearch(t *testing.T) {
 		firstReturn.Part.ToolCallID != "search" ||
 		firstReturn.Part.ProviderDetails["thought_signature"] != "return-signature" {
 		t.Fatalf("explicit file search metadata was lost: %#v", events)
+	}
+}
+
+func TestGoogleStreamPairsIDLessNativeToolReturns(t *testing.T) {
+	model := newNamedServer(t, "gemini-3-flash", googleSSE(t, []string{
+		`{"responseId":"response","candidates":[{"content":{"parts":[` +
+			`{"toolCall":{"toolType":"GOOGLE_SEARCH_WEB","args":{"query":"first"}}},` +
+			`{"toolCall":{"toolType":"URL_CONTEXT","args":{"url":"https://go.dev"}}},` +
+			`{"toolCall":{"toolType":"GOOGLE_SEARCH_WEB","args":{"query":"second"}}},` +
+			`{"toolResponse":{"toolType":"GOOGLE_SEARCH_WEB","response":{"first":true}}},` +
+			`{"toolResponse":{"toolType":"URL_CONTEXT","response":{"url":"https://go.dev"}}},` +
+			`{"toolResponse":{"toolType":"GOOGLE_SEARCH_WEB","response":{"second":true}}}` +
+			`]}}]}`,
+	}))
+	events, err := collectGoogleStream(t, model, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := map[ai.ToolPartKind][]string{}
+	returns := map[ai.ToolPartKind][]string{}
+	for _, event := range events {
+		switch event := event.(type) {
+		case ai.ToolCallStartEvent:
+			if event.Native {
+				calls[event.ToolKind] = append(calls[event.ToolKind], event.ToolCallID)
+			}
+		case ai.NativeToolReturnEvent:
+			returns[event.Part.ToolKind] = append(returns[event.Part.ToolKind], event.Part.ToolCallID)
+		}
+	}
+	for _, kind := range []ai.ToolPartKind{ai.ToolPartKindWebSearch, ai.ToolPartKindWebFetch} {
+		if !slices.Equal(calls[kind], returns[kind]) {
+			t.Fatalf("native %s calls and returns were not paired: calls=%#v returns=%#v", kind, calls, returns)
+		}
+	}
+
+	stream := ai.StreamModel(t.Context(), model, nil, ai.ModelRequestParams{})
+	for _, err := range stream.Events() {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	response := stream.Response()
+	completedCalls := map[ai.ToolPartKind][]string{}
+	completedReturns := map[ai.ToolPartKind][]string{}
+	for _, part := range response.Parts {
+		switch part := part.(type) {
+		case ai.NativeToolCallPart:
+			completedCalls[part.ToolKind] = append(completedCalls[part.ToolKind], part.ToolCallID)
+		case ai.NativeToolReturnPart:
+			completedReturns[part.ToolKind] = append(completedReturns[part.ToolKind], part.ToolCallID)
+		}
+	}
+	for _, kind := range []ai.ToolPartKind{ai.ToolPartKindWebSearch, ai.ToolPartKindWebFetch} {
+		if !slices.Equal(completedCalls[kind], completedReturns[kind]) {
+			t.Fatalf("completed native %s calls and returns were not paired: response=%#v", kind, response)
+		}
+	}
+}
+
+func TestGoogleStreamExplicitWebSearchNormalizesSources(t *testing.T) {
+	model := newNamedServer(t, "gemini-3-flash", googleSSE(t, []string{
+		`{"responseId":"response","candidates":[{"content":{"parts":[` +
+			`{"thoughtSignature":"call-signature","toolCall":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","args":{"query":"Go"}}},` +
+			`{"thoughtSignature":"return-signature","toolResponse":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","response":{"search_suggestions":"<style>chips</style>"}}}` +
+			`]}}]}`,
+		`{"responseId":"response","candidates":[{"content":{"parts":[]},"groundingMetadata":{"groundingChunks":[{"web":{"title":"Go","uri":"https://go.dev"}}]}}]}`,
+	}))
+	events, err := collectGoogleStream(t, model, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		returned, ok := event.(ai.NativeToolReturnEvent)
+		if !ok || returned.Part.ToolKind != ai.ToolPartKindWebSearch {
+			continue
+		}
+		sources, ok := returned.Part.Content.([]map[string]any)
+		if !ok || len(sources) != 1 || sources[0]["title"] != "Go" ||
+			returned.Part.ProviderDetails["thought_signature"] != "return-signature" {
+			t.Fatalf("explicit stream did not normalize sources: %#v", returned)
+		}
+		raw := returned.Part.ProviderDetails["google_tool_response"].(map[string]any)
+		if raw["search_suggestions"] != "<style>chips</style>" {
+			t.Fatalf("explicit stream did not retain raw response: %#v", returned.Part.ProviderDetails)
+		}
+		return
+	}
+	t.Fatalf("explicit stream omitted web search return: %#v", events)
+}
+
+func TestGoogleStreamExplicitWebSearchUsesImmediateSources(t *testing.T) {
+	model := newNamedServer(t, "gemini-3-flash", googleSSE(t, []string{
+		`{"responseId":"response","candidates":[{"content":{"parts":[` +
+			`{"toolCall":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","args":{}}},` +
+			`{"toolResponse":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","response":{"search_suggestions":"chips"}}}` +
+			`]},"groundingMetadata":{"groundingChunks":[{"web":{"title":"Go","uri":"https://go.dev"}}]}}]}`,
+	}))
+	events, err := collectGoogleStream(t, model, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		returned, ok := event.(ai.NativeToolReturnEvent)
+		if !ok || returned.Part.ToolKind != ai.ToolPartKindWebSearch {
+			continue
+		}
+		if sources := returned.Part.Content.([]map[string]any); len(sources) != 1 || sources[0]["uri"] != "https://go.dev" {
+			t.Fatalf("immediate sources were not normalized: %#v", returned)
+		}
+		return
+	}
+	t.Fatalf("immediate web search return was not emitted: %#v", events)
+}
+
+func TestGoogleStreamPendingWebSearchReturnCanStop(t *testing.T) {
+	model := newNamedServer(t, "gemini-3-flash", googleSSE(t, []string{
+		`{"responseId":"response","candidates":[{"content":{"parts":[` +
+			`{"toolCall":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","args":{}}},` +
+			`{"toolResponse":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","response":{"search_suggestions":"chips"}}}` +
+			`]}}]}`,
+		`{"responseId":"response","candidates":[{"content":{"parts":[]},"groundingMetadata":{"groundingChunks":[{"web":{"title":"Go","uri":"https://go.dev"}}]}}]}`,
+	}))
+	stream, err := model.StreamRequest(t.Context(), nil, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event, err := range stream {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := event.(ai.NativeToolReturnEvent); ok {
+			return
+		}
+	}
+	t.Fatal("pending web search return was not emitted")
+}
+
+func TestGoogleStreamDoesNotEmitLateReconstructedSearch(t *testing.T) {
+	grounding := `"groundingMetadata":{"webSearchQueries":["Go"],"groundingChunks":[{"web":{"title":"Go","uri":"https://go.dev"}}]}`
+	model := newServer(t, googleSSE(t, []string{
+		`{"responseId":"response","candidates":[{"content":{"parts":[{"text":"answer"}]}}]}`,
+		`{"responseId":"response","candidates":[{"content":{"parts":[]},` + grounding + `}]}`,
+	}))
+	events, err := collectGoogleStream(t, model, ai.ModelRequestParams{NativeTools: []ai.NativeTool{ai.WebSearchTool{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nativeEvents int
+	var finish ai.FinishEvent
+	for _, event := range events {
+		switch event := event.(type) {
+		case ai.ToolCallStartEvent:
+			if event.Native {
+				nativeEvents++
+			}
+		case ai.NativeToolReturnEvent:
+			nativeEvents++
+		case ai.FinishEvent:
+			finish = event
+		}
+	}
+	if nativeEvents != 0 || finish.ProviderDetails["grounding_metadata"] == nil {
+		t.Fatalf("late grounding became a tool phase or was lost: %#v", events)
 	}
 }
 
@@ -503,6 +668,30 @@ func TestGoogleStreamWebSearchConsumerBreak(t *testing.T) {
 	if seen != 1 {
 		t.Fatalf("stream yielded %d events before break", seen)
 	}
+}
+
+func TestGoogleStreamUnpairedWebSearchReturnCanStop(t *testing.T) {
+	model := newNamedServer(t, "gemini-3-flash", googleSSE(t, []string{
+		`{"responseId":"response","candidates":[{"content":{"parts":[{"toolResponse":{"toolType":"GOOGLE_SEARCH_WEB","response":{"status":"done"}}}]}}]}`,
+	}))
+	stream, err := model.StreamRequest(t.Context(), nil, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event, err := range stream {
+		if err != nil {
+			t.Fatal(err)
+		}
+		returned, ok := event.(ai.NativeToolReturnEvent)
+		if !ok {
+			continue
+		}
+		if returned.Part.ToolCallID != "response:google_search_web:0" {
+			t.Fatalf("unexpected unpaired native return: %#v", returned)
+		}
+		return
+	}
+	t.Fatal("expected pending native return")
 }
 
 func normalizedGoogleText(event ai.StreamEvent) string {

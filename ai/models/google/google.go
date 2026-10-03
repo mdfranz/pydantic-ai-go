@@ -84,14 +84,25 @@ func (m *Model) SupportsNativeTool(tool ai.NativeTool) bool {
 	if err := ai.ValidateNativeTools([]ai.NativeTool{tool}); err != nil {
 		return false
 	}
-	switch tool.CloneNativeTool().(type) {
-	case ai.WebSearchTool, ai.WebFetchTool, ai.CodeExecutionTool, ai.FileSearchTool:
+	switch tool := tool.CloneNativeTool().(type) {
+	case ai.WebSearchTool:
+		return googleSupportsWebSearch(tool)
+	case ai.WebFetchTool, ai.CodeExecutionTool, ai.FileSearchTool:
 		return true
 	case ai.ImageGenerationTool:
 		return supportsImageOutput(m.name)
 	default:
 		return false
 	}
+}
+
+func googleSupportsWebSearch(tool ai.WebSearchTool) bool {
+	return len(tool.AllowedDomains) == 0 &&
+		len(tool.BlockedDomains) == 0 &&
+		tool.MaxUses == 0 &&
+		(tool.ExternalWebAccess == nil || *tool.ExternalWebAccess) &&
+		tool.UserLocation == nil &&
+		(tool.SearchContextSize == "" || tool.SearchContextSize == ai.WebSearchContextMedium)
 }
 
 // ModelProfile reports model behavior and the bundled context window when known.
@@ -523,7 +534,21 @@ func googleNativeTools(
 	var generatedImageConfig *imageConfig
 	for _, nativeTool := range nativeTools {
 		switch tool := nativeTool.(type) {
-		case ai.WebSearchTool, *ai.WebSearchTool:
+		case ai.WebSearchTool:
+			if !googleSupportsWebSearch(tool) {
+				if tool.Optional {
+					continue
+				}
+				return nil, nil, fmt.Errorf("google: web search configuration is not supported")
+			}
+			tools = append(tools, toolsParam{GoogleSearch: &struct{}{}})
+		case *ai.WebSearchTool:
+			if !googleSupportsWebSearch(*tool) {
+				if tool.Optional {
+					continue
+				}
+				return nil, nil, fmt.Errorf("google: web search configuration is not supported")
+			}
 			tools = append(tools, toolsParam{GoogleSearch: &struct{}{}})
 		case ai.WebFetchTool, *ai.WebFetchTool:
 			tools = append(tools, toolsParam{URLContext: &struct{}{}})
@@ -928,7 +953,7 @@ func (model *Model) convertResponse(m ai.ModelResponse) ([]content, error) {
 			})
 		case ai.NativeToolCallPart:
 			toolType := googleNativeToolType(rp.ToolKind)
-			if rp.ProviderName != model.providerName || toolType == "" {
+			if rp.ProviderName != model.providerName || toolType == "" || googleReconstructedNativeTool(rp.ProviderDetails) {
 				continue
 			}
 			args := map[string]any{}
@@ -943,11 +968,15 @@ func (model *Model) convertResponse(m ai.ModelResponse) ([]content, error) {
 			})
 		case ai.NativeToolReturnPart:
 			toolType := googleNativeToolType(rp.ToolKind)
-			if rp.ProviderName != model.providerName || toolType == "" {
+			if rp.ProviderName != model.providerName || toolType == "" || googleReconstructedNativeTool(rp.ProviderDetails) {
 				continue
 			}
+			response := rp.Content
+			if raw, ok := rp.ProviderDetails[googleToolResponseKey]; ok {
+				response = raw
+			}
 			parts = append(parts, part{
-				ToolResponse:     &googleToolResponse{ID: rp.ToolCallID, ToolType: toolType, Response: rp.Content},
+				ToolResponse:     &googleToolResponse{ID: rp.ToolCallID, ToolType: toolType, Response: response},
 				ThoughtSignature: model.googleThoughtSignature(rp.ProviderName, rp.ProviderDetails),
 			})
 		case ai.ToolCallPart:
@@ -991,6 +1020,26 @@ func googlePartMetadata(signature, providerName string) (string, map[string]any)
 		return "", nil
 	}
 	return providerName, map[string]any{"thought_signature": signature}
+}
+
+const (
+	googleReconstructedNativeToolKey = "google_reconstructed_native_tool"
+	googleToolResponseKey            = "google_tool_response"
+)
+
+func googleReconstructedNativeTool(details map[string]any) bool {
+	reconstructed, _ := details[googleReconstructedNativeToolKey].(bool)
+	return reconstructed
+}
+
+func googleNativeReturnDetails(details map[string]any, response any) map[string]any {
+	if details == nil {
+		details = make(map[string]any, 1)
+	} else {
+		details = cloneGoogleMap(details)
+	}
+	details[googleToolResponseKey] = response
+	return details
 }
 
 func (model *Model) googleThoughtSignature(providerName string, details map[string]any) string {
@@ -1187,6 +1236,25 @@ func googleWebSearchParts(
 		return nil, nil
 	}
 	args, _ := json.Marshal(map[string]any{"queries": queries})
+	results := googleWebSearchSources(metadata)
+	callID := responseID + ":web_search"
+	if responseID == "" {
+		callID = "web_search"
+	}
+	call := &ai.NativeToolCallPart{
+		ToolName: "web_search", ToolCallID: callID, ToolKind: ai.ToolPartKindWebSearch,
+		Args: args, ProviderName: providerName,
+		ProviderDetails: map[string]any{googleReconstructedNativeToolKey: true},
+	}
+	result := &ai.NativeToolReturnPart{
+		ToolName: "web_search", ToolCallID: callID, ToolKind: ai.ToolPartKindWebSearch,
+		Content: results, Timestamp: timestamp, ProviderName: providerName,
+		ProviderDetails: map[string]any{googleReconstructedNativeToolKey: true},
+	}
+	return call, result
+}
+
+func googleWebSearchSources(metadata map[string]any) []map[string]any {
 	var results []map[string]any
 	if chunks, ok := metadata["groundingChunks"].([]any); ok {
 		for _, rawChunk := range chunks {
@@ -1205,19 +1273,7 @@ func googleWebSearchParts(
 			results = append(results, result)
 		}
 	}
-	callID := responseID + ":web_search"
-	if responseID == "" {
-		callID = "web_search"
-	}
-	call := &ai.NativeToolCallPart{
-		ToolName: "web_search", ToolCallID: callID, ToolKind: ai.ToolPartKindWebSearch,
-		Args: args, ProviderName: providerName,
-	}
-	result := &ai.NativeToolReturnPart{
-		ToolName: "web_search", ToolCallID: callID, ToolKind: ai.ToolPartKindWebSearch,
-		Content: results, Timestamp: timestamp, ProviderName: providerName,
-	}
-	return call, result
+	return results
 }
 
 func googleWebFetchParts(
@@ -1518,6 +1574,12 @@ func parseResponse(data []byte, providerName string, fileSearchEnabled bool) (*a
 			}
 			callID = googleNativeCallID(callID, gr.ResponseID, p.ToolResponse.ToolType, index)
 			response := p.ToolResponse.Response
+			if kind == ai.ToolPartKindWebSearch {
+				if sources := googleWebSearchSources(gr.Candidates[0].GroundingMetadata); len(sources) > 0 {
+					response = sources
+					providerDetails = googleNativeReturnDetails(providerDetails, p.ToolResponse.Response)
+				}
+			}
 			if kind == ai.ToolPartKindFileSearch && response == nil {
 				if contexts := googleFileSearchContexts(gr.Candidates[0].GroundingMetadata); len(contexts) > 0 {
 					response = contexts

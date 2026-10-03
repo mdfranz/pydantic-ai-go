@@ -828,6 +828,87 @@ func TestGoogleWebSearchGroundingMetadata(t *testing.T) {
 	}
 }
 
+func TestGoogleExplicitWebSearchNormalizesSourcesAndReplaysRawResponse(t *testing.T) {
+	var replay map[string]any
+	requests := 0
+	model := newNamedServer(t, "gemini-3-flash", func(response http.ResponseWriter, request *http.Request) {
+		requests++
+		if requests == 2 {
+			if err := json.NewDecoder(request.Body).Decode(&replay); err != nil {
+				t.Error(err)
+			}
+		}
+		_, _ = response.Write([]byte(`{
+			"responseId":"response",
+			"candidates":[{"content":{"parts":[
+				{"thoughtSignature":"call-signature","toolCall":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","args":{"query":"Go"}}},
+				{"thoughtSignature":"return-signature","toolResponse":{"id":"search","toolType":"GOOGLE_SEARCH_WEB","response":{"search_suggestions":"<style>chips</style>"}}}
+			]},"groundingMetadata":{"groundingChunks":[{"web":{"title":"Go","uri":"https://go.dev"}}]}}]
+		}`))
+	})
+	response, err := model.Request(t.Context(), nil, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Parts) != 2 {
+		t.Fatalf("unexpected explicit web search response: %#v", response.Parts)
+	}
+	returned := response.Parts[1].(ai.NativeToolReturnPart)
+	sources, ok := returned.Content.([]map[string]any)
+	if !ok || len(sources) != 1 || sources[0]["uri"] != "https://go.dev" ||
+		returned.ProviderDetails["thought_signature"] != "return-signature" {
+		t.Fatalf("explicit web search did not expose sources: %#v", returned)
+	}
+	if raw := returned.ProviderDetails["google_tool_response"].(map[string]any); raw["search_suggestions"] != "<style>chips</style>" {
+		t.Fatalf("explicit web search did not retain its raw response: %#v", returned.ProviderDetails)
+	}
+	if _, err := model.Request(t.Context(), []ai.ModelMessage{*response}, ai.ModelRequestParams{}); err != nil {
+		t.Fatal(err)
+	}
+	parts := replay["contents"].([]any)[0].(map[string]any)["parts"].([]any)
+	callPart := parts[0].(map[string]any)
+	returnPart := parts[1].(map[string]any)
+	call := callPart["toolCall"].(map[string]any)
+	returnedBody := returnPart["toolResponse"].(map[string]any)
+	if call["id"] != "search" || callPart["thoughtSignature"] != "call-signature" ||
+		returnedBody["id"] != "search" || returnPart["thoughtSignature"] != "return-signature" ||
+		returnedBody["response"].(map[string]any)["search_suggestions"] != "<style>chips</style>" {
+		t.Fatalf("explicit web search replay changed provider data: %#v", parts)
+	}
+}
+
+func TestGoogleDoesNotReplayReconstructedWebSearch(t *testing.T) {
+	var replay map[string]any
+	requests := 0
+	model := newServer(t, func(response http.ResponseWriter, request *http.Request) {
+		requests++
+		if requests == 2 {
+			if err := json.NewDecoder(request.Body).Decode(&replay); err != nil {
+				t.Error(err)
+			}
+		}
+		_, _ = response.Write([]byte(`{
+			"responseId":"response",
+			"candidates":[{"content":{"parts":[{"text":"answer"}]},
+			"groundingMetadata":{"webSearchQueries":["Go"],"groundingChunks":[{"web":{"title":"Go","uri":"https://go.dev"}}]}}]
+		}`))
+	})
+	response, err := model.Request(t.Context(), nil, ai.ModelRequestParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Parts) != 3 {
+		t.Fatalf("legacy web search was not retained in history: %#v", response.Parts)
+	}
+	if _, err := model.Request(t.Context(), []ai.ModelMessage{*response}, ai.ModelRequestParams{}); err != nil {
+		t.Fatal(err)
+	}
+	parts := replay["contents"].([]any)[0].(map[string]any)["parts"].([]any)
+	if len(parts) != 1 || parts[0].(map[string]any)["text"] != "answer" {
+		t.Fatalf("reconstructed web search replayed synthetic tools: %#v", parts)
+	}
+}
+
 func TestGoogleWebFetchURLContextMetadata(t *testing.T) {
 	responses := []string{
 		`{"responseId":"response","candidates":[{"content":{"parts":[{"text":"answer"}]},"urlContextMetadata":{"urlMetadata":[1,{"retrievedUrl":"https://go.dev","urlRetrievalStatus":"URL_RETRIEVAL_STATUS_SUCCESS"},{"urlRetrievalStatus":"URL_RETRIEVAL_STATUS_ERROR"}]}}]}`,
